@@ -86,6 +86,29 @@ Security, performance and feature-parity review results are in [REVIEW.md](REVIE
 `slate --self-test --network` checks that GStreamer finds the plugins it needs and can
 stream over HTTPS, then exits (useful for packaged builds).
 
+## DJ mixer
+
+Settings → Playback → DJ mixer. When your queue runs out, instead of dropping straight to
+the radio fallback, a chat model picks the next genre (told about the last things you
+heard, your history and your direction), Slate finds matching tracks on TIDAL and loads
+a block of them — so the music keeps going in a direction you approve of.
+
+- **Bring your own model.** The DJ talks to any OpenAI-compatible `chat/completions`
+  endpoint: OpenAI, OpenRouter, Ollama, or whatever you run locally. Base URL, model name
+  and API key live in the same row-group and are only used when the DJ is enabled.
+- **Steer it, don't program it.** The direction box takes plain words — "deeper into
+  house", "back to the album I was on" — and it applies to the DJ's next block. "DJ up a
+  block" forces one right now.
+- **Fails soft.** Any error — no key, bad endpoint, unparseable answer, search miss —
+  falls through to the original autoplay radio, so the queue never dead-air. The DJ
+  never interrupts tracks you queued yourself.
+- **Off by default.** Nothing calls the model and no setting is written until you
+  turn it on.
+
+The decision logic is unit-tested standalone in `crates/slate-core/src/dj.rs`; wire up a
+real endpoint via the environment (`DJ_BASE_URL`, `DJ_MODEL`, `DJ_API_KEY`) or the
+settings screen.
+
 ## Build
 
 Requirements: a recent stable Rust toolchain and GStreamer 1.20+ (1.24+ for gapless).

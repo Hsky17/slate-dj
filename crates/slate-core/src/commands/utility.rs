@@ -300,6 +300,18 @@ pub fn set_discord_rpc(state: &AppState, enabled: bool) -> Result<(), SlateError
     Ok(())
 }
 
+/// DJ mixer settings (enabled, endpoint, model, key) — stored on `Settings::dj`.
+pub fn get_dj(state: &AppState) -> crate::dj::DjSettings {
+    state.load_settings().map(|s| s.dj).unwrap_or_default()
+}
+
+pub fn set_dj(state: &AppState, dj: crate::dj::DjSettings) -> Result<(), SlateError> {
+    let mut settings = state.load_settings().unwrap_or_default();
+    settings.dj = dj;
+    state.save_settings(&settings)?;
+    Ok(())
+}
+
 pub fn get_report_plays(state: &AppState) -> bool {
     state
         .load_settings()

@@ -36,6 +36,7 @@ struct Snapshot {
     auth_max: bool,
     mcp: (bool, String),
     overlay: (bool, String),
+    dj: slate_core::dj::DjSettings,
 }
 
 /// Choices of the crossfade setting, in seconds (0 = off).
@@ -52,6 +53,7 @@ async fn snapshot(state: &Arc<AppState>) -> Snapshot {
         exclusive: utility::get_exclusive_mode(state),
         bit_perfect: utility::get_bit_perfect(state),
         report_plays: utility::get_report_plays(state),
+        dj: utility::get_dj(state),
         discord_rpc: utility::get_discord_rpc(state),
         discord_text: utility::get_discord_status_text(state),
         discord: utility::get_discord_prefs(state),
@@ -133,6 +135,10 @@ fn apply(w: &AppWindow, s: Snapshot, prefs: &UiPrefs) {
     g.set_devices(ModelRc::new(VecModel::from(names)));
     g.set_device_index(s.device_index);
     g.set_report_plays(s.report_plays);
+    g.set_dj_enabled(s.dj.enabled);
+    g.set_dj_base_url(s.dj.base_url.clone().into());
+    g.set_dj_model(s.dj.model.clone().into());
+    g.set_dj_api_key(s.dj.api_key.clone().into());
     for (name, connected, user) in s.providers {
         match name.as_str() {
             "listenbrainz" => {
@@ -228,6 +234,11 @@ impl Backend {
                     utility::set_crossfade(&state, c.secs, v).map_err(|e| e.log_safe())
                 }
                 "gapless" => utility::set_gapless(&state, v).map_err(|e| e.log_safe()),
+        "dj-enabled" => {
+            let mut d = utility::get_dj(&state);
+            d.enabled = v;
+            utility::set_dj(&state, d).map_err(|e| e.log_safe())
+        }
                 "exclusive" => utility::set_exclusive_mode(&state, v).map_err(|e| e.log_safe()),
                 "bit-perfect" => utility::set_bit_perfect(&state, v).map_err(|e| e.log_safe()),
                 "report-plays" => utility::set_report_plays(&state, v)
@@ -337,6 +348,18 @@ impl Backend {
                 }
                 return;
             }
+            if key == "dj-base-url" || key == "dj-model" || key == "dj-api-key" {
+                let mut d = utility::get_dj(&state);
+                match key.as_str() {
+                    "dj-base-url" => d.base_url = v.trim().to_string(),
+                    "dj-model" => d.model = v.trim().to_string(),
+                    _ => d.api_key = v.trim().to_string(),
+                }
+                if let Err(e) = utility::set_dj(&state, d) {
+                    this.settings_status(format!("Could not save DJ settings: {}", e.log_safe()));
+                }
+                return;
+            }
             if key == "discord-text" {
                 if let Err(e) = utility::set_discord_status_text(&state, v) {
                     this.settings_status(format!("Could not save status text: {}", e.log_safe()));
@@ -395,6 +418,18 @@ impl Backend {
                     );
                 }
                 "agent-refresh" => this.load_settings_ui(),
+                "dj-go" => {
+                    let d = this
+                        .read_ui(|w| w.global::<SettingsState>().get_dj_direction().to_string())
+                        .await;
+                    this.dj_direction(d);
+                    this.settings_status("Direction set — it steers the DJ's next block.");
+                    this.ui(|w| w.global::<SettingsState>().set_dj_direction("".into()));
+                }
+                "dj-now" => {
+                    this.settings_status("DJ is picking the next block…");
+                    this.dj_next();
+                }
                 n if n.starts_with("agent-bearer-") => this.agent_bearer_action(n),
                 "pkce-start" => this.start_pkce(),
                 "pkce-finish" => this.finish_pkce().await,

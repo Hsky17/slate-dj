@@ -51,6 +51,12 @@ export global SettingsState {
     in-out property <string> global-shortcuts-hint;
     in-out property <[string]> devices;
     in-out property <int> device-index;
+    // DJ mixer
+    in-out property <bool> dj-enabled;
+    in-out property <string> dj-base-url;
+    in-out property <string> dj-model;
+    in-out property <string> dj-api-key;
+    in-out property <string> dj-direction;
     // Scrobbling
     in-out property <bool> report-plays;
     in-out property <bool> lb-connected;
@@ -506,6 +512,37 @@ export component SettingsPage inherits Rectangle {
                             index: SettingsState.device-index;
                             picked(i) => { SettingsState.device-index = i; SettingsState.changed-int("device", i); }
                         }
+                    }
+                    Row {
+                        label: "DJ mixer";
+                        hint: "When the queue runs dry, a model picks the next genre, finds tracks on TIDAL and keeps the music going. Point it at any OpenAI-compatible chat endpoint.";
+                        Toggle { checked: SettingsState.dj-enabled; toggled(v) => { SettingsState.dj-enabled = v; SettingsState.changed-bool("dj-enabled", v); } }
+                    }
+                    if SettingsState.dj-enabled: Row {
+                        label: "DJ endpoint";
+                        hint: "OpenAI-compatible base URL.";
+                        TextField { text: SettingsState.dj-base-url; placeholder: "https://api.openai.com/v1"; field-width: 260px; accepted(t) => { SettingsState.dj-base-url = t; SettingsState.changed-str("dj-base-url", t); } }
+                    }
+                    if SettingsState.dj-enabled: Row {
+                        label: "DJ model";
+                        hint: "Name of the chat model to ask.";
+                        TextField { text: SettingsState.dj-model; placeholder: "gpt-4o-mini"; field-width: 220px; accepted(t) => { SettingsState.dj-model = t; SettingsState.changed-str("dj-model", t); } }
+                    }
+                    if SettingsState.dj-enabled: Row {
+                        label: "DJ API key";
+                        hint: "Stored with your other settings.";
+                        TextField { text: SettingsState.dj-api-key; placeholder: "sk-…"; field-width: 280px; accepted(t) => { SettingsState.dj-api-key = t; SettingsState.changed-str("dj-api-key", t); } }
+                    }
+                    Row {
+                        label: "DJ direction";
+                        hint: "Tell the DJ where to take it — “deeper into house” or “back to what I was hearing”. Applies to its next block.";
+                        TextField { text <=> SettingsState.dj-direction; placeholder: "deeper into house"; field-width: 260px; }
+                        Button { label: "Send"; clicked => { SettingsState.action("dj-go"); } }
+                    }
+                    if SettingsState.dj-enabled: Row {
+                        label: "Now";
+                        hint: "Force a new genre block immediately, without waiting for the queue to run dry.";
+                        Button { label: "DJ up a block"; primary: true; clicked => { SettingsState.action("dj-now"); } }
                     }
                 }
 
