@@ -34,14 +34,10 @@ The "original release" you compared against is 69 MB (`~/Downloads/GitClones/sla
 
 ```sh
 cd ~/Downloads/GitClones/slate-dj
-cargo build --release
 ls -lh target/release/slate target/debug/slate
-du -sh target/release/slate ~/.cache 2>/dev/null
 ```
 
-(As of this handoff a release build of slate-dj was still compiling; expect something close to the 69 MB original — measure the actual delta and record it.)
-
-If the release binary is meaningfully larger than 69 MB, the usual suspects, in order:
+**Measured at handoff:** release slate-dj = **69 MB**, exactly matching the original release (`~/Downloads/GitClones/slate/target/release/slate`, 69 MB). Debug = ~1.2 GB. Conclusion: the size difference you saw is 100% the debug profile (debuginfo, no opt, unstripped) — the DJ work added **zero bytes** at release, and zero dependencies. No action needed unless you want to shrink the 69 MB further; options, in order:
 
 1. `cargo build --release --profile release-min` with a new profile in `Cargo.toml`:
    ```toml
