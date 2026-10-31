@@ -531,8 +531,8 @@ export component SettingsPage inherits Rectangle {
                     }
                     if SettingsState.dj-enabled: Row {
                         label: "DJ API key";
-                        hint: "Stored with your other settings.";
-                        TextField { text: SettingsState.dj-api-key; placeholder: "sk-…"; field-width: 280px; accepted(t) => { SettingsState.dj-api-key = t; SettingsState.changed-str("dj-api-key", t); } }
+                        hint: "Leave blank if your endpoint needs no auth — but some endpoints reject requests without any Authorization header, in which case type any filler key.";
+                        TextField { text: SettingsState.dj-api-key; placeholder: "sk-… (or a filler key)"; field-width: 280px; accepted(t) => { SettingsState.dj-api-key = t; SettingsState.changed-str("dj-api-key", t); } }
                     }
                     Row {
                         label: "DJ direction";
