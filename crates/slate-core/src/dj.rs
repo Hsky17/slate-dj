@@ -180,6 +180,13 @@ pub fn speak(line: Option<&str>) {
 pub struct Dj {
     http: crate::proxy_http::ProxiedHttp,
     cfg: DjSettings,
+    /// One line a human can read, explaining the most recent `decide`/`ping`
+    /// outcome — success or the reason it could not move. Written by the DJ,
+    /// read by the controller when `decide` returns `None`.
+    last_diag: std::sync::Mutex<Option<String>>,
+    /// The raw model text of the most recent answer (if any), so "nothing
+    /// happened" can show *what the model actually said* instead of a guess.
+    last_raw: std::sync::Mutex<Option<String>>,
 }
 
 impl Dj {
@@ -190,7 +197,27 @@ impl Dj {
         Self {
             cfg: settings.resolved(),
             http,
+            last_diag: std::sync::Mutex::new(None),
+            last_raw: std::sync::Mutex::new(None),
         }
+    }
+
+    fn note_diag(&self, msg: impl Into<String>) {
+        *self.last_diag.lock().unwrap() = Some(msg.into());
+    }
+
+    fn note_raw(&self, raw: &str) {
+        *self.last_raw.lock().unwrap() = Some(raw.to_string());
+    }
+
+    /// Human-readable explanation of the most recent `decide`/`ping` outcome.
+    pub fn last_diag(&self) -> Option<String> {
+        self.last_diag.lock().unwrap().clone()
+    }
+
+    /// Raw model text of the most recent answer, if the endpoint answered at all.
+    pub fn last_raw(&self) -> Option<String> {
+        self.last_raw.lock().unwrap().clone()
     }
 
     pub fn enabled(&self) -> bool {
@@ -206,10 +233,15 @@ impl Dj {
     }
 
     /// Ask the LLM for the next block. `None` = unavailable or unparseable; the
-    /// caller falls back to the usual autoplay radio.
+    /// caller falls back to the usual autoplay radio. Every `None` leaves a
+    /// human-readable reason in `last_diag()` (and the raw reply, if any, in
+    /// `last_raw()`), so the UI can say *why* nothing moved instead of guessing.
     pub async fn decide(&self, ctx: &DjContext) -> Option<DjMove> {
         let base_url = self.cfg.base_url.trim();
         if base_url.is_empty() || self.cfg.model.trim().is_empty() {
+            self.note_diag(
+                "The DJ endpoint or model is not filled in (Settings → Playback).",
+            );
             return None;
         }
         let url = format!("{base_url}/chat/completions", base_url = base_url.trim_end_matches('/'));
@@ -243,10 +275,59 @@ impl Dj {
             },
         });
         if let Ok(raw) = self.post(&url, &body).await {
-            return parse_move(&raw);
+            self.note_raw(&raw);
+            if let Some(m) = parse_move(&raw) {
+                return Some(m);
+            }
+            self.note_diag(&format!(
+                "The endpoint answered, but the reply was not a usable move: {}",
+                &raw.chars().take(200).collect::<String>()
+            ));
+            return None;
         }
         // 2) retry plain, then parse whatever came back.
-        self.post(&url, &base).await.ok().and_then(|raw| parse_move(&raw))
+        match self.post(&url, &base).await {
+            Ok(raw) => {
+                self.note_raw(&raw);
+                parse_move(&raw).or_else(|| {
+                    self.note_diag(&format!(
+                        "The endpoint answered, but the reply was not a usable move: {}",
+                        &raw.chars().take(200).collect::<String>()
+                    ));
+                    None
+                })
+            }
+            Err(e) => {
+                self.note_diag(&format!("The endpoint did not answer: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Connectivity check for the settings "Test endpoint" button: one minimal
+    /// completion through exactly the same path the live DJ uses (saved
+    /// settings, same client, same response handling). The `Ok` message is
+    /// human-readable and includes latency; the `Err` message says what failed.
+    pub async fn ping(&self) -> Result<String, String> {
+        let base_url = self.cfg.base_url.trim();
+        if base_url.is_empty() || self.cfg.model.trim().is_empty() {
+            return Err(
+                "Fill in the DJ endpoint and model first (Settings → Playback).".to_string(),
+            );
+        }
+        let url = format!("{base_url}/chat/completions", base_url = base_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": self.cfg.model,
+            "messages": [{ "role": "user", "content": "Reply with the single word: pong" }],
+        });
+        let started = std::time::Instant::now();
+        let raw = self.post(&url, &body).await?;
+        let ms = started.elapsed().as_millis();
+        let head = raw.trim().chars().take(80).collect::<String>();
+        Ok(format!(
+            "Connected — '{}' answered in {ms} ms: {head}",
+            self.cfg.model.trim()
+        ))
     }
 
     async fn post(&self, url: &str, body: &serde_json::Value) -> Result<String, String> {
@@ -329,5 +410,134 @@ mod tests {
             Dj::new(s, crate::proxy_http::ProxiedHttp::blocked("test")).block_size(),
             10
         );
+    }
+
+    fn direct_http() -> crate::proxy_http::ProxiedHttp {
+        crate::proxy_http::ProxiedHttp::from_settings(
+            &crate::ProxySettings::default(),
+            &crate::proxy::HostCaps::assume_all_present(),
+        )
+    }
+
+    fn chat_response(content: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{ "message": { "content": content } }]
+        }))
+    }
+
+    #[tokio::test]
+    async fn ping_reports_a_successful_completion_with_latency() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(chat_response("pong"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dj = Dj::new(
+            DjSettings {
+                enabled: true,
+                base_url: server.uri(),
+                model: "test-model".into(),
+                ..Default::default()
+            },
+            direct_http(),
+        );
+        let msg = dj.ping().await.expect("ping should succeed");
+        assert!(msg.contains("Connected"), "got: {msg}");
+        assert!(msg.contains("pong"), "got: {msg}");
+        assert!(msg.contains("ms"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn ping_reports_an_http_error_instead_of_silence() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(401).set_body_string("invalid api key"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dj = Dj::new(
+            DjSettings {
+                base_url: server.uri(),
+                model: "test-model".into(),
+                api_key: "sk-nope".into(),
+                ..Default::default()
+            },
+            direct_http(),
+        );
+        let err = dj.ping().await.expect_err("a 401 must be an error");
+        assert!(err.contains("401"), "got: {err}");
+        assert!(err.contains("invalid api key"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn ping_refuses_while_the_proxy_is_blocked() {
+        let dj = Dj::new(
+            DjSettings {
+                base_url: "https://example.invalid/v1".into(),
+                model: "test-model".into(),
+                ..Default::default()
+            },
+            crate::proxy_http::ProxiedHttp::blocked("test-block"),
+        );
+        let err = dj.ping().await.expect_err("blocked client must not egress");
+        assert!(err.contains("test-block"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn ping_refuses_when_endpoints_are_not_filled_in() {
+        let dj = Dj::new(
+            DjSettings::default(),
+            crate::proxy_http::ProxiedHttp::blocked("test-block"),
+        );
+        let err = dj.ping().await.expect_err("settings missing must not touch the network");
+        assert!(err.contains("endpoint"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn decide_which_fails_leaves_a_readable_diagnosis() {
+        // Endpoint answers 200, but with prose, not the JSON the DJ needs.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(chat_response("I think something slower and deeper works now."))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dj = Dj::new(
+            DjSettings {
+                base_url: server.uri(),
+                model: "test-model".into(),
+                ..Default::default()
+            },
+            direct_http(),
+        );
+        assert!(dj.decide(&DjContext::default()).await.is_none());
+        let raw = dj.last_raw().expect("raw reply must be kept for the UI");
+        assert!(raw.contains("slower and deeper"), "raw: {raw}");
+        let diag = dj.last_diag().expect("a diagnosis must be left behind");
+        assert!(diag.contains("not a usable move"), "diag: {diag}");
+    }
+
+    #[tokio::test]
+    async fn decide_which_succeeds_returns_the_move() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(chat_response(r#"{"query":"deep house","reason":"groove"}"#))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dj = Dj::new(
+            DjSettings {
+                base_url: server.uri(),
+                model: "test-model".into(),
+                ..Default::default()
+            },
+            direct_http(),
+        );
+        let m = dj.decide(&DjContext::default()).await.expect("a good reply must parse");
+        assert_eq!(m.query, "deep house");
+        assert_eq!(m.reason, "groove");
     }
 }

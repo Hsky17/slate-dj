@@ -57,6 +57,7 @@ export global SettingsState {
     in-out property <string> dj-model;
     in-out property <string> dj-api-key;
     in-out property <string> dj-direction;
+    in-out property <string> dj-status;
     // Scrobbling
     in-out property <bool> report-plays;
     in-out property <bool> lb-connected;
@@ -543,6 +544,12 @@ export component SettingsPage inherits Rectangle {
                         label: "Now";
                         hint: "Force a new genre block immediately, without waiting for the queue to run dry.";
                         Button { label: "DJ up a block"; primary: true; clicked => { SettingsState.action("dj-now"); } }
+                    }
+                    if SettingsState.dj-enabled: Row {
+                        label: "Connection";
+                        hint: "Tests the endpoint the same way the DJ talks to it, with one tiny request.";
+                        Text { text: SettingsState.dj-status == "" ? "Not tested yet" : SettingsState.dj-status; }
+                        Button { label: "Test endpoint"; clicked => { SettingsState.action("dj-test"); } }
                     }
                 }
 

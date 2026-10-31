@@ -430,6 +430,25 @@ impl Backend {
                     this.settings_status("DJ is picking the next block…");
                     this.dj_next();
                 }
+                "dj-test" => {
+                    let dj = this.read_ui(dj_from_ui).await;
+                    this.settings_status("Testing the DJ endpoint…");
+                    match utility::dj_test_endpoint(dj, &state).await {
+                        Ok(msg) => {
+                            this.ui(
+                                |w| w.global::<SettingsState>().set_dj_status("Connected".into()),
+                            );
+                            this.settings_status(msg);
+                        }
+                        Err(e) => {
+                            let label = format!("Not connected: {e}");
+                            this.ui(move |w| {
+                                w.global::<SettingsState>().set_dj_status(label.into())
+                            });
+                            this.settings_status(format!("DJ endpoint test failed: {e}"));
+                        }
+                    }
+                }
                 n if n.starts_with("agent-bearer-") => this.agent_bearer_action(n),
                 "pkce-start" => this.start_pkce(),
                 "pkce-finish" => this.finish_pkce().await,
@@ -637,4 +656,15 @@ fn proxy_from_ui(w: AppWindow) -> Option<ProxySettings> {
         username: opt(g.get_proxy_user()),
         password: opt(g.get_proxy_pass()),
     })
+}
+
+fn dj_from_ui(w: AppWindow) -> slate_core::dj::DjSettings {
+    let g = w.global::<SettingsState>();
+    slate_core::dj::DjSettings {
+        enabled: g.get_dj_enabled(),
+        base_url: g.get_dj_base_url().to_string(),
+        api_key: g.get_dj_api_key().to_string(),
+        model: g.get_dj_model().to_string(),
+        ..slate_core::dj::DjSettings::default()
+    }
 }

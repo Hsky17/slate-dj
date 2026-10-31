@@ -113,6 +113,10 @@ pub struct Controller {
     dj_direction: std::sync::Mutex<Option<String>>,
     /// Why the current DJ block was chosen (fed back into the next prompt).
     dj_reason: std::sync::Mutex<Option<String>>,
+    /// Last DJ attempt, in words a listener understands: success
+    /// ("DJ is up a block — 'deep house'") or the reason nothing moved
+    /// ("TIDAL had no results for '…'"). `None` until the DJ was asked.
+    dj_status: std::sync::Mutex<Option<String>>,
 }
 
 fn now_secs() -> i64 {
@@ -134,6 +138,7 @@ impl Controller {
             fade_checked: std::sync::Mutex::new(None),
             dj_direction: std::sync::Mutex::new(None),
             dj_reason: std::sync::Mutex::new(None),
+            dj_status: std::sync::Mutex::new(None),
         }
     }
 
@@ -519,11 +524,30 @@ impl Controller {
         self.dj_reason.lock().ok().and_then(|g| g.clone())
     }
 
+    /// The last DJ attempt in listener words — success or why nothing moved.
+    /// `None` until the DJ was first asked (`dj_next` / autoplay).
+    pub fn dj_status(&self) -> Option<String> {
+        self.dj_status.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn dj_note(&self, msg: impl Into<String>) {
+        if let Ok(mut g) = self.dj_status.lock() {
+            *g = Some(msg.into());
+        }
+    }
+
     /// DJ autoplay: LLM picks the next genre, TIDAL search fills a block, install it.
     /// `None` = DJ unavailable/disabled → caller falls back to `autoplay`.
     async fn dj_autoplay(&self, q: &mut Queue) -> Option<Track> {
-        let settings = self.state.load_settings()?;
+        let settings = match self.state.load_settings() {
+            Some(s) => s,
+            None => {
+                self.dj_note("Could not read settings to run the DJ.");
+                return None;
+            }
+        };
         if !settings.dj.enabled {
+            self.dj_note("The DJ is disabled — enable it in Settings → Playback.");
             return None;
         }
         let dj = crate::dj::Dj::new(settings.dj, self.state.proxied_http.clone());
@@ -551,10 +575,28 @@ impl Controller {
             direction: self.dj_take_direction(),
             last_reason: self.dj_last_reason(),
         };
-        let move_ = dj.decide(&ctx).await?;
+        let move_ = match dj.decide(&ctx).await {
+            Some(m) => m,
+            None => {
+                self.dj_note(dj.last_diag().unwrap_or_else(|| {
+                    "The DJ endpoint did not answer, or the reply was not usable.".to_string()
+                }));
+                return None;
+            }
+        };
 
         let mut client = self.state.tidal_client.lock().await;
-        let results = client.search(&move_.query, dj.block_size()).await.ok()?;
+        let results = match client.search(&move_.query, dj.block_size()).await {
+            Ok(r) => r,
+            Err(e) => {
+                drop(client);
+                self.dj_note(format!(
+                    "TIDAL did not return results for the DJ's query '{}': {e}",
+                    move_.query
+                ));
+                return None;
+            }
+        };
         drop(client);
         let radio: Vec<Track> = results
             .tracks
@@ -562,11 +604,15 @@ impl Controller {
             .filter_map(Track::from_serialized)
             .collect();
         if radio.is_empty() {
+            self.dj_note(format!(
+                "TIDAL matched the DJ's query '{}' but nothing of it could be loaded as a track.",
+                move_.query
+            ));
             return None;
         }
 
         let prefs = self.prefs();
-        let first = q.install_autoplay(radio, |t| {
+        let first = match q.install_autoplay(radio, |t| {
             if prefs.blocks(t) {
                 Some(Skip::Blocked)
             } else if t.is_unavailable(now_secs()) {
@@ -574,13 +620,30 @@ impl Controller {
             } else {
                 None
             }
-        })?;
+        }) {
+            Some(first) => first,
+            None => {
+                self.dj_note(
+                    "The DJ's best matches were blocked by your filters or unavailable.",
+                );
+                return None;
+            }
+        };
 
         if !move_.reason.is_empty() {
             if let Ok(mut g) = self.dj_reason.lock() {
                 *g = Some(move_.reason.clone());
             }
         }
+        self.dj_note(format!(
+            "DJ is up a block — '{}'{}",
+            move_.query,
+            if move_.reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({}).", move_.reason)
+            }
+        ));
         self.app_handle
             .emit(
                 "dj-branch",

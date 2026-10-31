@@ -756,7 +756,16 @@ impl Backend {
         self.rt.spawn(async move {
             let Some(ctl) = this.controller() else { return };
             let outcome = ctl.dj_next().await;
+            let failed = matches!(outcome, Outcome::Nothing);
             this.apply(outcome).await;
+            if failed {
+                // Say *why* the DJ did not come up instead of staying silent.
+                let why = ctl.dj_status().unwrap_or_else(|| {
+                    "The DJ could not pick a block. Check its endpoint in Settings → Playback."
+                        .to_string()
+                });
+                this.ui(move |w| w.set_error(why.into()));
+            }
         });
     }
 

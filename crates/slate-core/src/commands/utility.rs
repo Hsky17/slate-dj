@@ -312,6 +312,17 @@ pub fn set_dj(state: &AppState, dj: crate::dj::DjSettings) -> Result<(), SlateEr
     Ok(())
 }
 
+/// The "Test endpoint" button for the DJ section. Verifies the exact
+/// settings the user is editing, through exactly the path the live DJ uses
+/// (same client, same request, same response handling) — so what it reports
+/// is what the DJ will experience.
+pub async fn dj_test_endpoint(
+    dj: crate::dj::DjSettings,
+    state: &AppState,
+) -> Result<String, String> {
+    crate::dj::Dj::new(dj, state.proxied_http.clone()).ping().await
+}
+
 pub fn get_report_plays(state: &AppState) -> bool {
     state
         .load_settings()
