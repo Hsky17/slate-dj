@@ -56,6 +56,7 @@ export global SettingsState {
     in-out property <string> dj-base-url;
     in-out property <string> dj-model;
     in-out property <string> dj-api-key;
+    in-out property <int> dj-timeout-index: 2;
     in-out property <string> dj-direction;
     in-out property <string> dj-status;
     // Scrobbling
@@ -533,6 +534,15 @@ export component SettingsPage inherits Rectangle {
                         label: "DJ API key";
                         hint: "Leave blank if your endpoint needs no auth — but some endpoints reject requests without any Authorization header, in which case type any filler key.";
                         TextField { text: SettingsState.dj-api-key; placeholder: "sk-… (or a filler key)"; field-width: 280px; accepted(t) => { SettingsState.dj-api-key = t; SettingsState.changed-str("dj-api-key", t); } }
+                    }
+                    if SettingsState.dj-enabled: Row {
+                        label: "DJ timeout";
+                        hint: "How long to wait for the model's answer. A local model can be slow, especially while it loads — pick something comfortable and the test button will wait that long.";
+                        Segmented {
+                            options: ["1 min", "2 min", "5 min", "10 min", "15 min"];
+                            index: SettingsState.dj-timeout-index;
+                            picked(i) => { SettingsState.dj-timeout-index = i; SettingsState.changed-int("dj-timeout", i); }
+                        }
                     }
                     Row {
                         label: "DJ direction";

@@ -26,6 +26,10 @@ pub struct DjSettings {
     pub speak: bool,
     /// Tracks per genre block at TIDAL search time. 0 = default (10).
     pub block_size: u32,
+    /// Seconds to wait for the model's answer. 0 = default (300). Local models
+    /// can be slow — loading an 8B VLM into VRAM plus generating can take well
+    /// over a minute, so the default is generous (clamped to 1..=3600).
+    pub timeout_secs: u64,
 }
 
 impl DjSettings {
@@ -51,6 +55,9 @@ impl DjSettings {
         }
         if let Some(v) = env("DJ_BLOCK").and_then(|v| v.trim().parse::<u32>().ok()) {
             r.block_size = v;
+        }
+        if let Some(v) = env("DJ_TIMEOUT").and_then(|v| v.trim().parse::<u64>().ok()) {
+            r.timeout_secs = v;
         }
         r
     }
@@ -232,6 +239,36 @@ impl Dj {
         }
     }
 
+    /// Effective per-request timeout in seconds: the configured value clamped
+    /// to a sane range, 300 s when unset (0). Local models are slow — loading
+    /// plus generating far outlasts a typical 45 s request cap, so the default
+    /// waits long enough for a cold 8B model before giving up.
+    pub fn timeout_secs(&self) -> u64 {
+        match self.cfg.timeout_secs {
+            0 => 300,
+            s => s.clamp(1, 3600),
+        }
+    }
+
+    /// Turn a transport-level failure (no answer at all) into a sentence that
+    /// says what happened and what to try, instead of the bare reqwest text
+    /// ("error sending request for url (…)") which reads like a bug in Slate.
+    fn send_error(&self, e: reqwest::Error) -> String {
+        let base = e.to_string();
+        if e.is_connect() {
+            return format!(
+                "Could not reach the server — is it running at that address and port? ({base})"
+            );
+        }
+        if e.is_timeout() {
+            return format!(
+                "The endpoint did not answer within {} s — a local model usually just needs more time while it loads or generates slowly. Wait a moment and test again, or raise the DJ timeout in Settings. ({base})",
+                self.timeout_secs()
+            );
+        }
+        base
+    }
+
     /// Ask the LLM for the next block. `None` = unavailable or unparseable; the
     /// caller falls back to the usual autoplay radio. Every `None` leaves a
     /// human-readable reason in `last_diag()` (and the raw reply, if any, in
@@ -298,7 +335,9 @@ impl Dj {
                 })
             }
             Err(e) => {
-                self.note_diag(&format!("The endpoint did not answer: {e}"));
+                // Keep the music flowing: the endpoint said no (or was slow),
+                // the diagnosis for the UI is why, not silence.
+                self.note_diag(&e);
                 None
             }
         }
@@ -335,11 +374,17 @@ impl Dj {
         let mut req = client
             .post(url)
             .json(body)
-            .timeout(std::time::Duration::from_secs(45));
+            // A hung endpoint must not wedge autoplay: the radio still plays —
+            // but a local model may need minutes to load and generate, so the
+            // cap is generous (settings → DJ timeout) rather than 45 s.
+            .timeout(std::time::Duration::from_secs(self.timeout_secs()));
         if !self.cfg.api_key.trim().is_empty() {
             req = req.bearer_auth(self.cfg.api_key.trim());
         }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| self.send_error(e))?;
         let status = resp.status();
         let text = resp.text().await.map_err(|e| e.to_string())?;
         if !status.is_success() {
@@ -411,6 +456,95 @@ mod tests {
             10
         );
     }
+
+    /// The 45 s cap behind the user's "error sending request" timeout: a local
+    /// model loading plus generating far outlasts it, so the effective timeout
+    /// defaults generous and clamps to a sane range.
+    #[test]
+    fn effective_timeout_is_generous_and_clamped() {
+        let mk = |secs: u64| {
+            Dj::new(
+                DjSettings {
+                    timeout_secs: secs,
+                    ..DjSettings::default()
+                },
+                crate::proxy_http::ProxiedHttp::blocked("test"),
+            )
+        };
+        assert_eq!(mk(0).timeout_secs(), 300, "unset (0) must mean the generous default");
+        assert_eq!(mk(60).timeout_secs(), 60);
+        assert_eq!(mk(999_999).timeout_secs(), 3600, "unusable caps must clamp down");
+    }
+
+    /// A model that takes longer than the cap must read as "slow", not as an
+    /// unexplained transport failure.
+    #[tokio::test]
+    async fn ping_names_the_timeout_when_the_model_is_slow() {
+        use std::time::Duration;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(chat_response("pong").set_delay(Duration::from_millis(2000)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dj = Dj::new(
+            DjSettings {
+                base_url: server.uri(),
+                model: "test-model".into(),
+                timeout_secs: 1,
+                ..Default::default()
+            },
+            direct_http(),
+        );
+        let err = dj.ping().await.expect_err("the 1 s cap must expire first");
+        assert!(err.contains("within 1 s"), "got: {err}");
+        assert!(err.contains("loads or generates slowly"), "got: {err}");
+    }
+
+    /// The other reading of the same reqwest text: the server was never there.
+    #[tokio::test]
+    async fn ping_names_an_unreachable_server() {
+        // Port 1 on localhost: connection refused, deterministically, no DNS.
+        let dj = Dj::new(
+            DjSettings {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                model: "test-model".into(),
+                ..Default::default()
+            },
+            direct_http(),
+        );
+        let err = dj.ping().await.expect_err("nothing listens there");
+        assert!(err.contains("Could not reach the server"), "got: {err}");
+    }
+
+    /// Opt-in live check against a real endpoint — the suite stays hermetic
+    /// unless someone sets DJ_LIVE=1 plus DJ_BASE_URL/DJ_MODEL:
+    ///   DJ_LIVE=1 DJ_BASE_URL=http://host:11434/v1 DJ_MODEL=qwen3-vl:8b \
+    ///   DJ_API_KEY=*** cargo test -p slate-core ping_live \
+    ///       -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn ping_live_opt_in() {
+        let base_url = std::env::var("DJ_BASE_URL").expect("DJ_BASE_URL");
+        let model = std::env::var("DJ_MODEL").expect("DJ_MODEL");
+        if !base_url.starts_with("http") || model.is_empty() {
+            return;
+        }
+        let dj = Dj::new(
+            DjSettings {
+                base_url,
+                model,
+                api_key: std::env::var("DJ_API_KEY").unwrap_or_default(),
+                ..DjSettings::default()
+            },
+            direct_http(),
+        );
+        let started = std::time::Instant::now();
+        let msg = dj.ping().await.expect("the live endpoint must answer");
+        let secs = started.elapsed().as_secs_f64();
+        eprintln!("LIVE OK in {secs:.1} s: {msg}");
+    }
+
 
     fn direct_http() -> crate::proxy_http::ProxiedHttp {
         crate::proxy_http::ProxiedHttp::from_settings(

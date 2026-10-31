@@ -42,6 +42,10 @@ struct Snapshot {
 /// Choices of the crossfade setting, in seconds (0 = off).
 const CROSSFADE_SECS: [u32; 7] = [0, 2, 4, 6, 8, 10, 12];
 
+/// DJ request-timeout choices, in seconds. A local model can take minutes to
+/// load and generate — anything tighter than 60 s will time out a real use.
+const DJ_TIMEOUT_SECS: [u64; 5] = [60, 120, 300, 600, 900];
+
 async fn snapshot(state: &Arc<AppState>) -> Snapshot {
     let mut s = Snapshot {
         minimize_to_tray: utility::get_minimize_to_tray(state),
@@ -139,6 +143,13 @@ fn apply(w: &AppWindow, s: Snapshot, prefs: &UiPrefs) {
     g.set_dj_base_url(s.dj.base_url.clone().into());
     g.set_dj_model(s.dj.model.clone().into());
     g.set_dj_api_key(s.dj.api_key.clone().into());
+    // 0 = unset, which the core reads as the generous 300 s default.
+    g.set_dj_timeout_index(
+        DJ_TIMEOUT_SECS
+            .iter()
+            .position(|x| *x == s.dj.timeout_secs)
+            .unwrap_or(2) as i32,
+    );
     for (name, connected, user) in s.providers {
         match name.as_str() {
             "listenbrainz" => {
@@ -323,6 +334,12 @@ impl Backend {
                     },
                     Err(e) => Err(e.log_safe()),
                 },
+                "dj-timeout" => {
+                    let mut d = utility::get_dj(&state);
+                    d.timeout_secs =
+                        DJ_TIMEOUT_SECS.get(usize_i).copied().unwrap_or(DJ_TIMEOUT_SECS[2]);
+                    utility::set_dj(&state, d).map_err(|e| e.log_safe())
+                }
                 _ => Ok(()),
             };
             if let Err(e) = result {
@@ -665,6 +682,10 @@ fn dj_from_ui(w: AppWindow) -> slate_core::dj::DjSettings {
         base_url: g.get_dj_base_url().to_string(),
         api_key: g.get_dj_api_key().to_string(),
         model: g.get_dj_model().to_string(),
+        timeout_secs: DJ_TIMEOUT_SECS
+            .get(g.get_dj_timeout_index() as usize)
+            .copied()
+            .unwrap_or(DJ_TIMEOUT_SECS[2]),
         ..slate_core::dj::DjSettings::default()
     }
 }

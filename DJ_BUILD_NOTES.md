@@ -572,3 +572,15 @@ Assume slice 1 landed. Changes EXACTLY:
 1. `cargo build -p slate-app` — must succeed.
 2. `cargo test -p slate-core` — full suite must stay green (long: ~10+ min; let it run).
 Do NOT "optimize" surrounding code. Do NOT touch the `autoplay_once`/`WaitForAgent` arms.
+
+## LATER — DJ timeout (DONE, do not redo)
+The endpoint test used to fail with a bare transport error ("error sending request
+for url (…)") because `post()` capped every request at 45 s — too short for a local
+model loading + generating. Now: `DjSettings.timeout_secs` (0 = default 300, clamp
+1..=3600), env `DJ_TIMEOUT`, `Dj::timeout_secs()`, `Dj::send_error()` classifies
+connect vs timeout for human messages, Settings → DJ mixer has a "DJ timeout"
+Segmented (1/2/5/10/15 min, `dj-timeout` → `DJ_TIMEOUT_SECS` in `settings.rs`),
+and `settings.rs` maps the picker back on `apply()`. Tests:
+`effective_timeout_is_generous_and_clamped`,
+`ping_names_the_timeout_when_the_model_is_slow`,
+`ping_names_an_unreachable_server`, opt-in `ping_live` (#[ignore]).
