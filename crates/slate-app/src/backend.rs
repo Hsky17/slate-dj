@@ -281,7 +281,7 @@ impl Backend {
             slate_core::startup::run_startup(&this.app).await;
             this.start_theme_watcher();
 
-            let controller = Arc::new(Controller::new(Arc::clone(&state)));
+            let controller = Arc::new(Controller::new(Arc::clone(&state), this.app.clone()));
             let (shuffle, repeat, autoplay) = controller.load_modes().await;
             controller.set_modes(shuffle, repeat, autoplay).await;
             match controller.restore().await {
@@ -748,6 +748,23 @@ impl Backend {
             let outcome = ctl.next(explicit).await;
             this.apply(outcome).await;
         });
+    }
+
+    /// DJ: force a new genre block right now (manual trigger).
+    pub fn dj_next(&self) {
+        let this = self.clone();
+        self.rt.spawn(async move {
+            let Some(ctl) = this.controller() else { return };
+            let outcome = ctl.dj_next().await;
+            this.apply(outcome).await;
+        });
+    }
+
+    /// Set the listener's next DJ direction (consumed on the next genre pick).
+    pub fn dj_direction(&self, text: String) {
+        if let Some(ctl) = self.controller() {
+            ctl.dj_set_direction(text);
+        }
     }
 
     pub fn previous(&self) {

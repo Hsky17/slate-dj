@@ -173,20 +173,24 @@ pub fn speak(line: Option<&str>) {
     });
 }
 
-/// Client for one OpenAI-compatible chat endpoint.
+/// Client for one OpenAI-compatible chat endpoint. Never builds its own
+/// connection: the app hands over its shared proxy-aware `ProxiedHttp`, so a
+/// blocked proxy degrades the DJ to the radio fallback instead of egressing
+/// direct (the rule `tests/source_guards.rs` enforces).
 pub struct Dj {
-    http: reqwest::Client,
+    http: crate::proxy_http::ProxiedHttp,
     cfg: DjSettings,
 }
 
 impl Dj {
-    pub fn new(settings: DjSettings) -> Self {
-        let cfg = settings.resolved();
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(45))
-            .build()
-            .unwrap_or_default();
-        Self { http, cfg }
+    pub fn new(
+        settings: DjSettings,
+        http: crate::proxy_http::ProxiedHttp,
+    ) -> Self {
+        Self {
+            cfg: settings.resolved(),
+            http,
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -246,7 +250,11 @@ impl Dj {
     }
 
     async fn post(&self, url: &str, body: &serde_json::Value) -> Result<String, String> {
-        let mut req = self.http.post(url).json(body);
+        let client = self.http.client().map_err(|e| e.cause)?;
+        let mut req = client
+            .post(url)
+            .json(body)
+            .timeout(std::time::Duration::from_secs(45));
         if !self.cfg.api_key.trim().is_empty() {
             req = req.bearer_auth(self.cfg.api_key.trim());
         }
@@ -317,6 +325,9 @@ mod tests {
         let s = DjSettings::default();
         assert!(!s.enabled);
         assert!(s.base_url.is_empty());
-        assert_eq!(Dj::new(s).block_size(), 10);
+        assert_eq!(
+            Dj::new(s, crate::proxy_http::ProxiedHttp::blocked("test")).block_size(),
+            10
+        );
     }
 }
