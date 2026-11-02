@@ -15,6 +15,7 @@
 )]
 
 pub mod audio;
+pub mod dj;
 pub mod events;
 pub mod lyrics;
 pub mod media;
@@ -281,6 +282,9 @@ pub struct Settings {
     /// Settings → Scrobbling.
     #[serde(default = "defaults::yes")]
     pub report_plays: bool,
+    /// DJ: LLM-driven genre continuity (off by default).
+    #[serde(default)]
+    pub dj: crate::dj::DjSettings,
 }
 
 impl Default for Settings {
@@ -324,6 +328,7 @@ impl Default for Settings {
             overlay_port: 5578,
             overlay_host: "127.0.0.1".to_string(),
             report_plays: true,
+            dj: crate::dj::DjSettings::default(),
         }
     }
 }

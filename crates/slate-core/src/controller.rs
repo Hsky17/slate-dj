@@ -94,6 +94,7 @@ pub enum Outcome {
 
 pub struct Controller {
     state: Arc<AppState>,
+    app_handle: crate::events::AppHandle,
     queue: Mutex<Queue>,
     prefs: std::sync::Mutex<ContentPrefs>,
     /// (track id, qid) currently armed for a gapless transition.
@@ -108,6 +109,14 @@ pub struct Controller {
     autoplay_once: std::sync::atomic::AtomicBool,
     /// Track for which a crossfade was already decided, so it is decided once.
     fade_checked: std::sync::Mutex<Option<u64>>,
+    /// Listener's latest explicit direction (consumed by the next DJ pick).
+    dj_direction: std::sync::Mutex<Option<String>>,
+    /// Why the current DJ block was chosen (fed back into the next prompt).
+    dj_reason: std::sync::Mutex<Option<String>>,
+    /// Last DJ attempt, in words a listener understands: success
+    /// ("DJ is up a block — 'deep house'") or the reason nothing moved
+    /// ("TIDAL had no results for '…'"). `None` until the DJ was asked.
+    dj_status: std::sync::Mutex<Option<String>>,
 }
 
 fn now_secs() -> i64 {
@@ -115,9 +124,10 @@ fn now_secs() -> i64 {
 }
 
 impl Controller {
-    pub fn new(state: Arc<AppState>) -> Self {
+    pub fn new(state: Arc<AppState>, app_handle: crate::events::AppHandle) -> Self {
         Self {
             state,
+            app_handle,
             queue: Mutex::new(Queue::new()),
             prefs: std::sync::Mutex::new(ContentPrefs::default()),
             armed: std::sync::Mutex::new(None),
@@ -126,6 +136,9 @@ impl Controller {
             armed_stream: std::sync::Mutex::new(None),
             autoplay_once: std::sync::atomic::AtomicBool::new(false),
             fade_checked: std::sync::Mutex::new(None),
+            dj_direction: std::sync::Mutex::new(None),
+            dj_reason: std::sync::Mutex::new(None),
+            dj_status: std::sync::Mutex::new(None),
         }
     }
 
@@ -431,7 +444,7 @@ impl Controller {
                 {
                     return Outcome::WaitForAgent;
                 }
-                Next::NeedAutoplay => match self.autoplay(q).await {
+                Next::NeedAutoplay => match self.autoplay_or_dj(q).await {
                     Some(first) => match self.start(q, first.clone(), false).await {
                         Ok(()) => return Outcome::Playing(first),
                         Err(PlayFailure::Unplayable) => {
@@ -494,6 +507,178 @@ impl Controller {
                 None
             }
         })
+    }
+
+    /// Set the listener's next DJ direction (consumed by the next genre pick).
+    pub fn dj_set_direction(&self, text: String) {
+        if let Ok(mut g) = self.dj_direction.lock() {
+            *g = Some(text);
+        }
+    }
+
+    fn dj_take_direction(&self) -> Option<String> {
+        self.dj_direction.lock().ok().and_then(|mut g| g.take())
+    }
+
+    fn dj_last_reason(&self) -> Option<String> {
+        self.dj_reason.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// The last DJ attempt in listener words — success or why nothing moved.
+    /// `None` until the DJ was first asked (`dj_next` / autoplay).
+    pub fn dj_status(&self) -> Option<String> {
+        self.dj_status.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn dj_note(&self, msg: impl Into<String>) {
+        if let Ok(mut g) = self.dj_status.lock() {
+            *g = Some(msg.into());
+        }
+    }
+
+    /// DJ autoplay: LLM picks the next genre, TIDAL search fills a block, install it.
+    /// `None` = DJ unavailable/disabled → caller falls back to `autoplay`.
+    async fn dj_autoplay(&self, q: &mut Queue) -> Option<Track> {
+        let settings = match self.state.load_settings() {
+            Some(s) => s,
+            None => {
+                self.dj_note("Could not read settings to run the DJ.");
+                return None;
+            }
+        };
+        if !settings.dj.enabled {
+            self.dj_note("The DJ is disabled — enable it in Settings → Playback.");
+            return None;
+        }
+        let dj = crate::dj::Dj::new(settings.dj, self.state.proxied_http.clone());
+
+        let title = |t: &Track| {
+            t.extra
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let artist = |t: &Track| t.artist_display();
+        let ctx = crate::dj::DjContext {
+            current: q.current.as_ref().map(|t| (title(t), artist(t))),
+            recent: q
+                .history
+                .iter()
+                .rev()
+                .take(20)
+                .map(|t| (title(t), artist(t)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+            direction: self.dj_take_direction(),
+            last_reason: self.dj_last_reason(),
+        };
+        let move_ = match dj.decide(&ctx).await {
+            Some(m) => m,
+            None => {
+                self.dj_note(dj.last_diag().unwrap_or_else(|| {
+                    "The DJ endpoint did not answer, or the reply was not usable.".to_string()
+                }));
+                return None;
+            }
+        };
+
+        let mut client = self.state.tidal_client.lock().await;
+        let results = match client.search(&move_.query, dj.block_size()).await {
+            Ok(r) => r,
+            Err(e) => {
+                drop(client);
+                self.dj_note(format!(
+                    "TIDAL did not return results for the DJ's query '{}': {e}",
+                    move_.query
+                ));
+                return None;
+            }
+        };
+        drop(client);
+        let radio: Vec<Track> = results
+            .tracks
+            .iter()
+            .filter_map(Track::from_serialized)
+            .collect();
+        if radio.is_empty() {
+            self.dj_note(format!(
+                "TIDAL matched the DJ's query '{}' but nothing of it could be loaded as a track.",
+                move_.query
+            ));
+            return None;
+        }
+
+        let prefs = self.prefs();
+        let first = match q.install_autoplay(radio, |t| {
+            if prefs.blocks(t) {
+                Some(Skip::Blocked)
+            } else if t.is_unavailable(now_secs()) {
+                Some(Skip::Unavailable)
+            } else {
+                None
+            }
+        }) {
+            Some(first) => first,
+            None => {
+                self.dj_note(
+                    "The DJ's best matches were blocked by your filters or unavailable.",
+                );
+                return None;
+            }
+        };
+
+        if !move_.reason.is_empty() {
+            if let Ok(mut g) = self.dj_reason.lock() {
+                *g = Some(move_.reason.clone());
+            }
+        }
+        self.dj_note(format!(
+            "DJ is up a block — '{}'{}",
+            move_.query,
+            if move_.reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({}).", move_.reason)
+            }
+        ));
+        self.app_handle
+            .emit(
+                "dj-branch",
+                serde_json::json!({
+                    "query": move_.query,
+                    "reason": move_.reason,
+                    "speaks": move_.speaks,
+                    "line": move_.line,
+                }),
+            )
+            .ok();
+        if move_.speaks {
+            crate::dj::speak(move_.line.as_deref());
+        }
+        Some(first)
+    }
+
+    /// DJ if available, else the usual TRACK_MIX radio. Drop-in for `autoplay`.
+    async fn autoplay_or_dj(&self, q: &mut Queue) -> Option<Track> {
+        if let Some(first) = self.dj_autoplay(q).await {
+            return Some(first);
+        }
+        self.autoplay(q).await
+    }
+
+    /// Force the DJ to pick a new block right now (manual trigger).
+    pub async fn dj_next(&self) -> Outcome {
+        let mut q = self.queue.lock().await;
+        let Some(first) = self.dj_autoplay(&mut q).await else {
+            return Outcome::Nothing;
+        };
+        match self.start(&mut q, first.clone(), true).await {
+            Ok(()) => Outcome::Playing(first),
+            Err(f) => Outcome::Failed(f),
+        }
     }
 
     pub async fn previous(&self) -> Outcome {
